@@ -1,0 +1,192 @@
+"""Inception-1D architecture for ECG classification."""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class InceptionModule1D(nn.Module):
+    """
+    1D Inception module with multiple parallel convolutional paths.
+    
+    Captures features at different temporal scales.
+    """
+    
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        
+        # Reduce channels before expensive operations
+        bottleneck = out_channels // 4
+        
+        # Path 1: 1x1 convolution
+        self.path1 = nn.Sequential(
+            nn.Conv1d(in_channels, bottleneck, kernel_size=1),
+            nn.BatchNorm1d(bottleneck),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Path 2: 1x1 -> 3x3 convolution
+        self.path2 = nn.Sequential(
+            nn.Conv1d(in_channels, bottleneck, kernel_size=1),
+            nn.BatchNorm1d(bottleneck),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(bottleneck, bottleneck, kernel_size=3, padding=1),
+            nn.BatchNorm1d(bottleneck),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Path 3: 1x1 -> 5x5 convolution
+        self.path3 = nn.Sequential(
+            nn.Conv1d(in_channels, bottleneck, kernel_size=1),
+            nn.BatchNorm1d(bottleneck),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(bottleneck, bottleneck, kernel_size=5, padding=2),
+            nn.BatchNorm1d(bottleneck),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Path 4: 3x3 max pool -> 1x1 convolution
+        self.path4 = nn.Sequential(
+            nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(in_channels, bottleneck, kernel_size=1),
+            nn.BatchNorm1d(bottleneck),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through all paths and concatenate."""
+        path1_out = self.path1(x)
+        path2_out = self.path2(x)
+        path3_out = self.path3(x)
+        path4_out = self.path4(x)
+        
+        # Concatenate along channel dimension
+        return torch.cat([path1_out, path2_out, path3_out, path4_out], dim=1)
+
+
+class Inception1D(nn.Module):
+    """
+    1D Inception network for ECG classification.
+    
+    Args:
+        in_channels: Number of input channels (12 for 12-lead ECG)
+        num_classes: Number of output classes (1 for binary classification)
+        base_filters: Number of filters in first layer (default: 64)
+        num_inception_blocks: Number of inception modules (default: 3)
+        dropout: Dropout probability (default: 0.5)
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 12,
+        num_classes: int = 1,
+        base_filters: int = 64,
+        num_inception_blocks: int = 3,
+        dropout: float = 0.5
+    ):
+        super().__init__()
+        
+        # Initial convolution to expand channels
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, base_filters, kernel_size=7, padding=3),
+            nn.BatchNorm1d(base_filters),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        )
+        
+        # Stack of Inception modules
+        self.inception_blocks = nn.ModuleList()
+        current_channels = base_filters
+        
+        for i in range(num_inception_blocks):
+            out_channels = base_filters * (2 ** i)
+            self.inception_blocks.append(InceptionModule1D(current_channels, out_channels))
+            current_channels = out_channels  # All 4 paths concatenated
+            
+            # Add max pooling after each inception block (except last)
+            if i < num_inception_blocks - 1:
+                self.inception_blocks.append(nn.MaxPool1d(kernel_size=3, stride=2, padding=1))
+        
+        # Global average pooling
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(current_channels, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, sequence_length)
+            
+        Returns:
+            Logits of shape (batch_size, num_classes)
+        """
+        # Stem
+        x = self.stem(x)
+        
+        # Inception blocks
+        for block in self.inception_blocks:
+            x = block(x)
+        
+        # Global average pooling
+        x = self.gap(x)
+        x = x.squeeze(-1)  # Remove sequence dimension
+        
+        # Classification
+        x = self.classifier(x)
+        
+        return x
+    
+    def get_num_params(self) -> int:
+        """Get total number of parameters."""
+        return sum(p.numel() for p in self.parameters())
+    
+    def get_num_trainable_params(self) -> int:
+        """Get number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def create_inception1d(
+    model_size: str = "small",
+    in_channels: int = 12,
+    num_classes: int = 1,
+    dropout: float = 0.5
+) -> Inception1D:
+    """
+    Factory function to create Inception1D models of different sizes.
+    
+    Args:
+        model_size: One of 'small', 'medium', 'large'
+        in_channels: Number of input channels
+        num_classes: Number of output classes
+        dropout: Dropout probability
+        
+    Returns:
+        Inception1D model
+    """
+    configs = {
+        'small': {'base_filters': 32, 'num_inception_blocks': 2},
+        'medium': {'base_filters': 64, 'num_inception_blocks': 3},
+        'large': {'base_filters': 96, 'num_inception_blocks': 4}
+    }
+    
+    if model_size not in configs:
+        raise ValueError(f"model_size must be one of {list(configs.keys())}")
+    
+    config = configs[model_size]
+    
+    return Inception1D(
+        in_channels=in_channels,
+        num_classes=num_classes,
+        base_filters=config['base_filters'],
+        num_inception_blocks=config['num_inception_blocks'],
+        dropout=dropout
+    )
