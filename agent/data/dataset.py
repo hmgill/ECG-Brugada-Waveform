@@ -1,0 +1,83 @@
+"""PyTorch Dataset for Brugada ECG recordings."""
+
+from typing import List, Optional
+
+import numpy as np
+import torch
+import wfdb
+from torch.utils.data import Dataset
+
+from .models import ECGMetadata, ECGSample, AugmentationConfig
+from .augmentation import ECGAugmentation
+
+
+class BrugadaDataset(Dataset):
+    """PyTorch Dataset for loading and preprocessing ECG signals."""
+    
+    def __init__(
+        self,
+        metadata_list: List[ECGMetadata],
+        augmentation_config: Optional[AugmentationConfig] = None,
+        normalize: bool = True,
+        normalization_method: str = "standardize",
+    ):
+        # Don't filter - let WFDB raise errors for missing files
+        self.metadata_list = metadata_list
+        self.normalize = normalize
+        self.normalization_method = normalization_method
+        
+        # Setup augmentation
+        self.augmentation = None
+        if augmentation_config is not None:
+            self.augmentation = ECGAugmentation(augmentation_config)
+    
+    def __len__(self) -> int:
+        return len(self.metadata_list)
+    
+    def __getitem__(self, idx: int) -> ECGSample:
+        metadata = self.metadata_list[idx]
+        
+        # Load ECG signal
+        signal = self._load_ecg(metadata)
+        
+        # Normalize
+        if self.normalize:
+            signal = self._normalize(signal)
+        
+        # Augment
+        if self.augmentation is not None:
+            signal = self.augmentation(signal)
+        
+        # Convert to tensor: (n_leads, n_samples) for Conv1D
+        signal_tensor = torch.from_numpy(signal.T).float()
+        
+        # Binary classification: treat brugada >= 1 as positive class
+        label = 1 if metadata.brugada >= 1 else 0
+        
+        
+        return ECGSample(
+            signal=signal_tensor,
+            label=torch.tensor(label, dtype=torch.long),
+            patient_id=metadata.patient_id,
+            basal_pattern=metadata.basal_pattern,
+            sudden_death=metadata.sudden_death
+        )
+    
+    def _load_ecg(self, metadata: ECGMetadata) -> np.ndarray:
+        """Load ECG from WFDB files."""
+        record_path = str(metadata.ecg_signal_path).replace('.dat', '')
+        record = wfdb.rdrecord(record_path)
+        return record.p_signal  # Shape: (n_samples, n_leads)
+    
+    def _normalize(self, signal: np.ndarray) -> np.ndarray:
+        """Normalize ECG signal."""
+        if self.normalization_method == "standardize":
+            mean = signal.mean(axis=0, keepdims=True)
+            std = signal.std(axis=0, keepdims=True) + 1e-8
+            return (signal - mean) / std
+        elif self.normalization_method == "minmax":
+            min_val = signal.min(axis=0, keepdims=True)
+            max_val = signal.max(axis=0, keepdims=True)
+            return (signal - min_val) / (max_val - min_val + 1e-8)
+        else:
+            return signal

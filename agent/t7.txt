@@ -1,0 +1,80 @@
+Start time: Sat Feb  7 02:37:11 EST 2026
+================================================================================
+BRUGADA ECG CLASSIFIER - K-FOLD CROSS-VALIDATION
+================================================================================
+
+[1/6] Loading configurations...
+✓ Random seed set to 42
+✓ Number of folds: 5
+
+[2/6] Initializing Logfire...
+
+[3/6] Setting up MLflow...
+✓ MLflow run: cv-5fold
+
+[4/6] Loading data...
+✓ Total samples: 363
+  Normal: 287, Brugada: 76
+
+[5/6] Setting up k-fold cross-validation...
+
+[6/6] Training folds...
+
+================================================================================
+FOLD 1
+================================================================================
+Train samples: 290
+Val samples: 73
+Standard BCE (no class weighting)
+
+Fold 1 Results:
+  Val AUROC: 0.8926
+  Val Accuracy: 0.8727
+  Val Sensitivity: 0.3636
+  Val F1: 0.5333
+
+================================================================================
+FOLD 2
+================================================================================
+Train samples: 290
+Val samples: 73
+Standard BCE (no class weighting)
+
+Fold 2 Results:
+  Val AUROC: 0.9008
+  Val Accuracy: 0.8727
+  Val Sensitivity: 0.3636
+  Val F1: 0.5333
+
+================================================================================
+FOLD 3
+================================================================================
+Train samples: 290
+Val samples: 73
+Standard BCE (no class weighting)
+
+Fold 3 Results:
+  Val AUROC: 0.9174
+  Val Accuracy: 0.3273
+  Val Sensitivity: 1.0000
+  Val F1: 0.3729
+
+================================================================================
+FOLD 4
+================================================================================
+Train samples: 291
+Val samples: 72
+Standard BCE (no class weighting)
+
+Fold 4 Results:
+  Val AUROC: 0.8822
+  Val Accuracy: 0.6909
+  Val Sensitivity: 0.9091
+  Val F1: 0.5405
+
+================================================================================
+FOLD 5
+================================================================================
+Train samples: 291
+Val samples: 72
+Standard BCE (no class weighting)
