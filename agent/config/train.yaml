@@ -1,0 +1,50 @@
+# Training Configuration for Brugada ECG Classification
+
+# Model
+model:
+  architecture: "transformer"  # Changed to transformer
+  size: "small"  # Start with small for 363 samples
+  dropout: 0.3
+
+# Loss Function
+loss:
+  type: "weighted_bce"
+  pos_weight: 2.5
+
+# Training
+training:
+  max_epochs: 150  # Transformers may need more epochs
+  learning_rate: 0.0001  # Slightly lower for transformers
+  weight_decay: 0.01  # Higher weight decay for transformers
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"  # Cosine annealing works well with transformers
+    t_max: 150
+  
+  # Early stopping
+  early_stopping:
+    monitor: "val_loss"
+    patience: 30  # More patience for transformers
+    mode: "min"
+  
+  # Checkpointing
+  checkpoint:
+    monitor: "val_auroc"
+    mode: "max"
+    save_top_k: 3
+    filename: "brugada-{epoch:02d}-{val_auroc:.3f}"
+
+# Hardware
+hardware:
+  accelerator: "auto"
+  devices: 1
+  precision: "32-true"
+
+# Logging
+logging:
+  log_every_n_steps: 10
+  log_model: true
+
+# Reproducibility
+seed: 42
