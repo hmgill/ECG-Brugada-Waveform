@@ -1,0 +1,133 @@
+# Training Configuration for Multi-Dataset ECG Disease Detection
+
+# Dataset Configuration
+data:
+  # Brugada-HUCA Dataset
+  use_brugada: true
+  brugada_metadata_path: "metadata_updated.csv"
+  brugada_data_root: "/N/slate/hungill/waveform"
+  
+  # PTB-XL Dataset
+  use_ptbxl: true
+  ptbxl_metadata_path: "ptbxl/ptbxl_database.csv"
+  ptbxl_data_root: "ptbxl/"
+  ptbxl_scp_statements_path: "ptbxl/scp_statements.csv"
+  ptbxl_sampling_ratio: 1.0  # Use 100% of PTB-XL data
+  
+  # Signal Processing
+  target_sampling_rate: 500  # Hz
+  target_length_seconds: 10.0  # seconds
+  
+  # Data Splits
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  stratified: true
+  random_seed: 42
+  
+  # Data Loading
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  
+  # Preprocessing
+  normalize: true
+  normalization_method: "standardize"  # z-score per lead
+  
+  # Augmentation
+  augment_train: true
+  augment_val: false
+  
+  augmentation:
+    amplitude_scale_range: [0.8, 1.2]
+    amplitude_scale_prob: 0.3
+    
+    noise_std: 0.05
+    noise_prob: 0.3
+    
+    baseline_wander_amplitude: 0.1
+    baseline_wander_frequency: [0.1, 0.5]
+    baseline_wander_prob: 0.2
+    
+    time_warp_sigma: 0.2
+    time_warp_knots: 4
+    time_warp_prob: 0.15
+    
+    lead_scale_range: [0.9, 1.1]
+    lead_scale_prob: 0.2
+    
+    # Lead masking for robustness to missing leads
+    lead_masking_prob: 0.3
+    lead_masking_max_leads: 6  # Mask up to 6 leads (keep at least 6)
+
+# Model Configuration
+model:
+  architecture: "ecg_transformer_rope"
+  size: "large"   # Up from "medium" - model is underfitting
+  in_channels: 12
+  num_superclasses: 5
+  num_subclasses: 23
+  dropout: 0.2    # Down from 0.3 - reduce regularization since underfitting
+
+# Loss Configuration
+loss:
+  type: "focal"  # Focal loss handles class imbalance better than plain BCE
+  
+  # Task weights (how much each task contributes to total loss)
+  # Increase superclass weight since it's underfitting (train ~= val AUROC)
+  task_weights:
+    superclass: 2.0   # Up from 1.0 - model needs more signal here
+    subclass: 0.5
+    brugada: 0.5      # Down from 1.0 - already excellent (0.997 AUROC)
+  
+  # Focal loss parameters
+  focal:
+    alpha_superclass: 0.75   # High alpha = more weight on positives (imbalanced classes)
+    alpha_subclass: 0.75
+    alpha_brugada: 0.25      # Lower alpha for brugada (already works well)
+    gamma: 2.0               # Focus on hard examples
+
+# Training Configuration
+training:
+  max_epochs: 200   # Up from 150 - more time to learn
+  learning_rate: 0.0002  # Slightly higher to escape current plateau
+  weight_decay: 0.005    # Down from 0.01 - less regularization (underfitting)
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"
+    t_max: 200
+    warmup_epochs: 10
+  
+  # Early stopping
+  early_stopping:
+    monitor: "val_total_loss"
+    patience: 40    # Up from 30 - give more time
+    mode: "min"
+  
+  # Checkpointing
+  checkpoint:
+    monitor: "val_sup_auroc_macro"
+    mode: "max"
+    save_top_k: 3
+    filename: "multitask-{epoch:02d}-{val_auroc_superclass:.3f}"
+
+# Hardware Configuration
+hardware:
+  accelerator: "gpu"  # Changed from 'auto' for explicit GPU usage
+  devices: 4  # Changed from 1 to use 2 GPUs
+  precision: "32-true"  # '16-mixed', '32-true', 'bf16-mixed'
+  strategy: "ddp"  # Distributed Data Parallel for multi-GPU
+
+# Logging Configuration
+logging:
+  log_every_n_steps: 10
+  log_model: true
+  project_name: "multi-ecg-disease-detection"
+  run_name: null  # Auto-generated if null
+
+# Cross-Validation (Optional)
+cross_validation:
+  enabled: false
+  n_folds: 5
+  stratified: true

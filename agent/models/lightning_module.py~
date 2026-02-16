@@ -1,0 +1,285 @@
+"""PyTorch Lightning module for multi-task ECG disease detection."""
+
+from typing import Optional, Dict, Any
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from torchmetrics import Accuracy, Precision, Recall, F1Score, AUROC, AveragePrecision, MetricCollection
+
+
+class MultiTaskClassifier(pl.LightningModule):
+    """
+    Lightning module for multi-task ECG classification.
+    
+    Tasks:
+    - Superclass classification (5 classes, multi-label)
+    - Subclass classification (23 classes, multi-label)
+    - Brugada detection (binary)
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        loss_fn: nn.Module,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-2,
+        scheduler_params: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__()
+        
+        self.model = model
+        self.loss_fn = loss_fn
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.scheduler_params = scheduler_params or {}
+        
+        # Class names for logging per-class metrics
+        self.superclass_names = ['NORM', 'MI', 'STTC', 'CD', 'HYP']
+        self.subclass_names = [
+            'NDT', 'NST_', 'DIG', 'LNGQT', 'NORM', 'IMI', 'ASMI', 'LVH', 
+            'LAFB/LPFB', 'ISC_', 'IRBBB', '1AVB', 'IVCD', 'ISCAL', 'CRBBB',
+            'CLBBB', 'ILMI', 'LAO/LAE', 'AMI', 'ALMI', 'IPLMI', 'IPMI', 'SEHYP'
+        ]  # Standard 23 PTB-XL subclasses
+        
+        # Save hyperparameters
+        self.save_hyperparameters(ignore=['model', 'loss_fn'])
+        
+        # Metrics for each task
+        # Superclass (5 classes, multi-label)
+        self.train_metrics_superclass = self._create_multilabel_metrics(num_labels=5, prefix='train_sup_')
+        self.val_metrics_superclass = self._create_multilabel_metrics(num_labels=5, prefix='val_sup_')
+        
+        # Subclass (23 classes, multi-label) 
+        self.train_metrics_subclass = self._create_multilabel_metrics(num_labels=23, prefix='train_sub_')
+        self.val_metrics_subclass = self._create_multilabel_metrics(num_labels=23, prefix='val_sub_')
+        
+        # Brugada (binary)
+        self.train_metrics_brugada = self._create_binary_metrics(prefix='train_brug_')
+        self.val_metrics_brugada = self._create_binary_metrics(prefix='val_brug_')
+    
+    def _create_multilabel_metrics(self, num_labels: int, prefix: str):
+        """Create metric collection for multi-label classification."""
+        metrics = {
+            # Macro-averaged metrics (average across classes)
+            'auroc_macro': AUROC(task='multilabel', num_labels=num_labels, average='macro'),
+            'auprc_macro': AveragePrecision(task='multilabel', num_labels=num_labels, average='macro'),
+            'f1_macro': F1Score(task='multilabel', num_labels=num_labels, average='macro'),
+            'precision_macro': Precision(task='multilabel', num_labels=num_labels, average='macro'),
+            'recall_macro': Recall(task='multilabel', num_labels=num_labels, average='macro'),
+            
+            # Per-class metrics (no averaging)
+            'auroc_per_class': AUROC(task='multilabel', num_labels=num_labels, average=None),
+            'f1_per_class': F1Score(task='multilabel', num_labels=num_labels, average=None),
+            'precision_per_class': Precision(task='multilabel', num_labels=num_labels, average=None),
+            'recall_per_class': Recall(task='multilabel', num_labels=num_labels, average=None),
+        }
+        return MetricCollection(metrics, prefix=prefix)
+    
+    def _create_binary_metrics(self, prefix: str):
+        """Create metric collection for binary classification."""
+        return MetricCollection({
+            'auroc': AUROC(task='binary'),
+            'auprc': AveragePrecision(task='binary'),
+            'acc': Accuracy(task='binary'),
+            'precision': Precision(task='binary'),
+            'recall': Recall(task='binary'),
+            'f1': F1Score(task='binary'),
+        }, prefix=prefix)
+    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass."""
+        return self.model(x)
+    
+    def training_step(self, batch, batch_idx):
+        """Training step."""
+        signals = batch['signal']
+        labels = batch['labels']
+        
+        # Forward pass
+        predictions = self(signals)
+        
+        # Compute losses
+        losses = self.loss_fn(predictions, labels)
+        
+        # Log losses
+        for loss_name, loss_value in losses.items():
+            self.log(f'train_{loss_name}_loss', loss_value, on_step=False, on_epoch=True, prog_bar=(loss_name == 'total'))
+        
+        # Compute metrics
+        # Superclass
+        sup_probs = torch.sigmoid(predictions['superclass'])
+        self.train_metrics_superclass.update(sup_probs, labels['superclass'].int())
+        
+        # Subclass
+        sub_probs = torch.sigmoid(predictions['subclass'])
+        self.train_metrics_subclass.update(sub_probs, labels['subclass'].int())
+        
+        # Brugada
+        brug_probs = torch.sigmoid(predictions['brugada'].squeeze(-1))
+        self.train_metrics_brugada.update(brug_probs, labels['brugada'].int())
+        
+        return losses['total']
+    
+    def on_train_epoch_end(self):
+        """Log training metrics at end of epoch."""
+        # Superclass
+        sup_metrics = self.train_metrics_superclass.compute()
+        for metric_name, metric_value in sup_metrics.items():
+            if 'per_class' in metric_name:
+                # Log per-class metrics with class names
+                metric_base = metric_name.replace('train_sup_', '').replace('_per_class', '')
+                for i, class_name in enumerate(self.superclass_names):
+                    self.log(f'train_sup_{metric_base}_{class_name}', metric_value[i], prog_bar=False)
+            else:
+                # Log macro-averaged metrics
+                self.log(metric_name, metric_value, prog_bar=('auroc' in metric_name))
+        self.train_metrics_superclass.reset()
+        
+        # Subclass
+        sub_metrics = self.train_metrics_subclass.compute()
+        for metric_name, metric_value in sub_metrics.items():
+            if 'per_class' in metric_name:
+                # Log per-class metrics with class names
+                metric_base = metric_name.replace('train_sub_', '').replace('_per_class', '')
+                for i, class_name in enumerate(self.subclass_names):
+                    self.log(f'train_sub_{metric_base}_{class_name}', metric_value[i], prog_bar=False)
+            else:
+                # Log macro-averaged metrics
+                self.log(metric_name, metric_value, prog_bar=False)
+        self.train_metrics_subclass.reset()
+        
+        # Brugada
+        brug_metrics = self.train_metrics_brugada.compute()
+        for metric_name, metric_value in brug_metrics.items():
+            self.log(metric_name, metric_value, prog_bar=('auroc' in metric_name))
+        self.train_metrics_brugada.reset()
+    
+    def validation_step(self, batch, batch_idx):
+        """Validation step."""
+        signals = batch['signal']
+        labels = batch['labels']
+        
+        # Forward pass
+        predictions = self(signals)
+        
+        # Compute losses
+        losses = self.loss_fn(predictions, labels)
+        
+        # Log losses
+        for loss_name, loss_value in losses.items():
+            self.log(f'val_{loss_name}_loss', loss_value, on_step=False, on_epoch=True, prog_bar=(loss_name == 'total'))
+        
+        # Compute metrics
+        # Superclass
+        sup_probs = torch.sigmoid(predictions['superclass'])
+        self.val_metrics_superclass.update(sup_probs, labels['superclass'].int())
+        
+        # Subclass
+        sub_probs = torch.sigmoid(predictions['subclass'])
+        self.val_metrics_subclass.update(sub_probs, labels['subclass'].int())
+        
+        # Brugada
+        brug_probs = torch.sigmoid(predictions['brugada'].squeeze(-1))
+        self.val_metrics_brugada.update(brug_probs, labels['brugada'].int())
+        
+        return losses['total']
+    
+    def on_validation_epoch_end(self):
+        """Log validation metrics at end of epoch."""
+        # Superclass
+        sup_metrics = self.val_metrics_superclass.compute()
+        for metric_name, metric_value in sup_metrics.items():
+            if 'per_class' in metric_name:
+                # Log per-class metrics with class names
+                metric_base = metric_name.replace('val_sup_', '').replace('_per_class', '')
+                for i, class_name in enumerate(self.superclass_names):
+                    self.log(f'val_sup_{metric_base}_{class_name}', metric_value[i], prog_bar=False)
+            else:
+                # Log macro-averaged metrics to progress bar
+                self.log(metric_name, metric_value, prog_bar=True)
+        self.val_metrics_superclass.reset()
+        
+        # Subclass
+        sub_metrics = self.val_metrics_subclass.compute()
+        for metric_name, metric_value in sub_metrics.items():
+            if 'per_class' in metric_name:
+                # Log per-class metrics with class names
+                metric_base = metric_name.replace('val_sub_', '').replace('_per_class', '')
+                for i, class_name in enumerate(self.subclass_names):
+                    self.log(f'val_sub_{metric_base}_{class_name}', metric_value[i], prog_bar=False)
+            else:
+                # Log macro-averaged metrics (not to progress bar - too many tasks)
+                self.log(metric_name, metric_value, prog_bar=False)
+        self.val_metrics_subclass.reset()
+        
+        # Brugada
+        brug_metrics = self.val_metrics_brugada.compute()
+        for metric_name, metric_value in brug_metrics.items():
+            self.log(metric_name, metric_value, prog_bar=('auroc' in metric_name))
+        self.val_metrics_brugada.reset()
+    
+    def test_step(self, batch, batch_idx):
+        """Test step."""
+        return self.validation_step(batch, batch_idx)
+    
+    def on_test_epoch_end(self):
+        """Log test metrics at end of epoch."""
+        self.on_validation_epoch_end()
+    
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler."""
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        
+        if not self.scheduler_params:
+            return optimizer
+        
+        # Create scheduler
+        scheduler_type = self.scheduler_params.get('type', 'cosine')
+        
+        if scheduler_type == 'cosine':
+            # Cosine annealing with warmup
+            from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+            
+            warmup_epochs = self.scheduler_params.get('warmup_epochs', 10)
+            total_epochs = self.scheduler_params.get('t_max', 150)
+            
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.1,
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs - warmup_epochs
+            )
+            
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+            
+            return [optimizer], [scheduler]
+        
+        elif scheduler_type == 'reduce_on_plateau':
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=self.scheduler_params.get('factor', 0.5),
+                patience=self.scheduler_params.get('patience', 5)
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'monitor': 'val_total_loss',
+                    'interval': 'epoch',
+                    'frequency': 1
+                }
+            }
+        else:
+            return optimizer

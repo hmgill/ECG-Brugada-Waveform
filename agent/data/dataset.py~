@@ -1,0 +1,338 @@
+"""Unified PyTorch Dataset with signal resampling for variable-length ECGs."""
+
+from typing import List, Optional, Dict
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+import wfdb
+from torch.utils.data import Dataset
+from scipy.signal import butter, filtfilt
+from scipy import signal as scipy_signal
+
+from .models import (
+    ECGMetadata, ECGSample, AugmentationConfig, 
+    DatasetSource, DiagnosticSuperclass
+)
+
+
+class ECGAugmentation:
+    """ECG-specific data augmentation."""
+    
+    def __init__(self, config: Optional[AugmentationConfig]):
+        self.config = config
+    
+    def __call__(self, signal: np.ndarray) -> np.ndarray:
+        """Apply random augmentations to ECG signal."""
+        if self.config is None:
+            return signal
+            
+        cfg = self.config
+        
+        # Amplitude scaling
+        if np.random.random() < cfg.amplitude_scale_prob:
+            signal = signal * np.random.uniform(*cfg.amplitude_scale_range)
+        
+        # Gaussian noise
+        if np.random.random() < cfg.noise_prob:
+            noise = np.random.normal(0, cfg.noise_std, signal.shape)
+            signal = signal + noise * signal.std()
+        
+        # Baseline wander
+        if np.random.random() < cfg.baseline_wander_prob:
+            signal = self._add_baseline_wander(signal)
+        
+        # Time warping
+        if np.random.random() < cfg.time_warp_prob:
+            signal = self._time_warp(signal)
+        
+        # Per-lead scaling
+        if np.random.random() < cfg.lead_scale_prob:
+            for lead_idx in range(signal.shape[1]):
+                signal[:, lead_idx] *= np.random.uniform(*cfg.lead_scale_range)
+        
+        # Lead masking (applied to numpy array before tensor conversion)
+        if np.random.random() < cfg.lead_masking_prob:
+            signal = self._mask_leads(signal)
+        
+        return signal
+    
+    def _add_baseline_wander(self, signal: np.ndarray) -> np.ndarray:
+        """Add low-frequency baseline wander."""
+        n_samples = signal.shape[0]
+        freq = np.random.uniform(*self.config.baseline_wander_frequency)
+        amplitude = self.config.baseline_wander_amplitude * (signal.max() - signal.min())
+        
+        t = np.arange(n_samples)
+        wander = amplitude * np.sin(2 * np.pi * freq * t / 100)
+        return signal + wander[:, np.newaxis]
+    
+    def _time_warp(self, signal: np.ndarray) -> np.ndarray:
+        """Apply subtle time warping using cubic spline."""
+        from scipy.interpolate import CubicSpline
+        
+        cfg = self.config
+        n_samples, n_leads = signal.shape
+        
+        # Create warping function
+        orig_steps = np.linspace(0, n_samples - 1, cfg.time_warp_knots)
+        warps = np.random.normal(0, cfg.time_warp_sigma, cfg.time_warp_knots)
+        warp_steps = np.sort(orig_steps + warps * n_samples)
+        warp_steps[0], warp_steps[-1] = 0, n_samples - 1
+        
+        warper = CubicSpline(orig_steps, warp_steps)
+        warped_indices = np.clip(warper(np.arange(n_samples)), 0, n_samples - 1)
+        
+        # Apply to all leads
+        warped = np.zeros_like(signal)
+        for lead_idx in range(n_leads):
+            warped[:, lead_idx] = np.interp(
+                warped_indices, np.arange(n_samples), signal[:, lead_idx]
+            )
+        
+        return warped
+    
+    def _mask_leads(self, signal: np.ndarray) -> np.ndarray:
+        """
+        Randomly zero out ECG leads to make model robust to missing leads.
+        
+        This simulates scenarios where:
+        - Only 1-lead, 3-lead, or 6-lead ECGs are available
+        - Individual leads fail or have poor signal quality
+        - Different monitoring setups with varying lead configurations
+        
+        Args:
+            signal: ECG signal of shape (n_samples, n_leads)
+            
+        Returns:
+            Signal with randomly masked leads (same shape)
+        """
+        cfg = self.config
+        n_samples, n_leads = signal.shape
+        
+        # Decide how many leads to mask (at least keep 12 - max_leads)
+        # E.g., if max_leads=6, mask 1-6 leads, keeping 6-11 leads
+        num_to_mask = np.random.randint(1, min(cfg.lead_masking_max_leads, n_leads - 1) + 1)
+        
+        # Randomly select which leads to mask
+        mask_indices = np.random.choice(n_leads, size=num_to_mask, replace=False)
+        
+        # Create a copy and zero out selected leads
+        signal_masked = signal.copy()
+        signal_masked[:, mask_indices] = 0
+        
+        return signal_masked
+
+
+class UnifiedECGDataset(Dataset):
+    """
+    Unified Dataset supporting multiple ECG datasets with variable-length signals.
+    
+    Features:
+    - Automatic resampling to target sampling rate
+    - Length standardization via padding/truncation
+    - Multi-hot label generation for superclasses
+    - Support for Brugada-HUCA and PTB-XL datasets
+    """
+    
+    def __init__(
+        self,
+        metadata_list: List[ECGMetadata],
+        data_roots: Dict[DatasetSource, Path],
+        scp_statements_df: Optional[pd.DataFrame] = None,
+        augmentation_config: Optional[AugmentationConfig] = None,
+        normalize: bool = True,
+        target_sampling_rate: int = 100,
+        target_length_seconds: float = 10.0
+    ):
+        self.metadata_list = metadata_list
+        self.data_roots = data_roots
+        self.normalize = normalize
+        self.target_sampling_rate = target_sampling_rate
+        self.target_length = int(target_sampling_rate * target_length_seconds)
+        
+        self.augmentation = ECGAugmentation(augmentation_config)
+        
+        # Prepare SCP Code -> Superclass mapping
+        self.scp_mapping = {}
+        if scp_statements_df is not None:
+            diag_df = scp_statements_df[scp_statements_df['diagnostic'] == 1]
+            self.scp_mapping = dict(zip(
+                diag_df.iloc[:, 0],  # First column is SCP code
+                diag_df['diagnostic_class']
+            ))
+        
+        # Fixed superclass order
+        self.superclass_order = [
+            DiagnosticSuperclass.NORM,
+            DiagnosticSuperclass.MI,
+            DiagnosticSuperclass.STTC,
+            DiagnosticSuperclass.CD,
+            DiagnosticSuperclass.HYP
+        ]
+    
+    def __len__(self) -> int:
+        return len(self.metadata_list)
+    
+    def __getitem__(self, idx: int) -> ECGSample:
+        metadata = self.metadata_list[idx]
+        
+        # 1. Load Signal
+        signal = self._load_and_resample_signal(metadata)
+        
+        # 2. Standardize length
+        signal = self._standardize_length(signal)
+        
+        # 3. Normalize
+        if self.normalize:
+            signal = self._normalize_signal(signal)
+        
+        # 4. Augment
+        signal = self.augmentation(signal)
+        
+        # 5. Transpose for PyTorch (Time, Leads) -> (Leads, Time)
+        signal_tensor = torch.from_numpy(signal.T).float()
+        
+        # 6. Generate Labels
+        labels = self._generate_labels(metadata)
+        
+        return ECGSample(
+            signal=signal_tensor,
+            label_superclass=labels['superclass'],
+            label_subclass=labels['subclass'],
+            label_brugada=labels['brugada'],
+            patient_id=str(metadata.patient_id),
+            source=metadata.dataset_source,
+            original_metadata=metadata,
+            readable_label=metadata.diagnosis_readable
+        )
+    
+    def _load_and_resample_signal(self, metadata: ECGMetadata) -> np.ndarray:
+        """Load ECG signal and resample to target sampling rate."""
+        root_path = self.data_roots.get(metadata.dataset_source)
+        if root_path is None:
+            raise ValueError(f"No data root specified for {metadata.dataset_source}")
+        
+        full_path = root_path / metadata.final_path
+        path_str = str(full_path).replace('.dat', '').replace('.hea', '')
+        
+        try:
+            record = wfdb.rdrecord(path_str)
+            signal = record.p_signal  # Shape: (n_samples, n_leads)
+            original_fs = record.fs
+            
+            # Resample if needed
+            if original_fs != self.target_sampling_rate:
+                signal = self._resample_signal(signal, original_fs, self.target_sampling_rate)
+            
+            # Ensure 12 leads (pad or truncate if needed)
+            if signal.shape[1] < 12:
+                # Pad with zeros
+                padding = np.zeros((signal.shape[0], 12 - signal.shape[1]))
+                signal = np.hstack([signal, padding])
+            elif signal.shape[1] > 12:
+                # Take first 12 leads
+                signal = signal[:, :12]
+            
+            return signal.astype(np.float32)
+            
+        except Exception as e:
+            print(f"Error loading {path_str}: {e}")
+            # Return zero-filled signal as fallback
+            return np.zeros((self.target_length, 12), dtype=np.float32)
+    
+    def _resample_signal(
+        self, 
+        signal: np.ndarray, 
+        original_fs: float, 
+        target_fs: float
+    ) -> np.ndarray:
+        """Resample signal using scipy.signal.resample."""
+        n_samples_original = signal.shape[0]
+        n_samples_target = int(n_samples_original * target_fs / original_fs)
+        
+        # Resample each lead independently
+        resampled = np.zeros((n_samples_target, signal.shape[1]), dtype=np.float32)
+        for lead_idx in range(signal.shape[1]):
+            resampled[:, lead_idx] = scipy_signal.resample(
+                signal[:, lead_idx], 
+                n_samples_target
+            )
+        
+        return resampled
+    
+    def _standardize_length(self, signal: np.ndarray) -> np.ndarray:
+        """Standardize signal length via padding or truncation."""
+        current_length = signal.shape[0]
+        
+        if current_length < self.target_length:
+            # Pad with zeros
+            padding = np.zeros((self.target_length - current_length, signal.shape[1]))
+            signal = np.vstack([signal, padding])
+        elif current_length > self.target_length:
+            # Truncate (take first target_length samples)
+            signal = signal[:self.target_length, :]
+        
+        return signal
+    
+    def _normalize_signal(self, signal: np.ndarray) -> np.ndarray:
+        """Z-score normalization per lead."""
+        mean = signal.mean(axis=0, keepdims=True)
+        std = signal.std(axis=0, keepdims=True) + 1e-8
+        return (signal - mean) / std
+    
+    def _generate_labels(self, metadata: ECGMetadata) -> Dict[str, torch.Tensor]:
+        """Generate all task labels."""
+        # A. Brugada Label (Binary)
+        is_brugada = 0
+        if metadata.brugada is not None:
+            is_brugada = 1 if metadata.brugada >= 1 else 0
+        elif metadata.scp_codes and 'BRUG' in metadata.scp_codes:
+            is_brugada = 1
+        
+        # B. Superclass Label (Multi-hot, 5 classes)
+        superclass_tensor = torch.zeros(5, dtype=torch.float)
+        
+        # Use the diagnostic_superclass from metadata (already populated during load)
+        if hasattr(metadata, 'diagnostic_superclass') and metadata.diagnostic_superclass:
+            for s_class in metadata.diagnostic_superclass:
+                try:
+                    idx_cls = self.superclass_order.index(s_class)
+                    superclass_tensor[idx_cls] = 1.0
+                except ValueError:
+                    pass
+        else:
+            # Fallback: try to generate from scp_codes if not already set
+            current_superclasses = []
+            if metadata.scp_codes and self.scp_mapping:
+                for code in metadata.scp_codes.keys():
+                    if code in self.scp_mapping:
+                        s_class_str = self.scp_mapping[code]
+                        try:
+                            enum_s_class = DiagnosticSuperclass(s_class_str)
+                            if enum_s_class not in current_superclasses:
+                                current_superclasses.append(enum_s_class)
+                        except ValueError:
+                            pass
+            
+            # Fill tensor based on fixed order
+            for s_class in current_superclasses:
+                try:
+                    idx_cls = self.superclass_order.index(s_class)
+                    superclass_tensor[idx_cls] = 1.0
+                except ValueError:
+                    pass
+        
+        # Handle Brugada-only data (assume Normal if brugada=0)
+        if metadata.dataset_source == DatasetSource.BRUGADA_HUCA and superclass_tensor.sum() == 0:
+            if is_brugada == 0:
+                superclass_tensor[0] = 1.0  # NORM
+        
+        # C. Subclass Label (Placeholder for 23 PTB-XL subclasses)
+        subclass_tensor = torch.zeros(23, dtype=torch.float)
+        
+        return {
+            'superclass': superclass_tensor,
+            'subclass': subclass_tensor,
+            'brugada': torch.tensor(is_brugada, dtype=torch.float)
+        }
