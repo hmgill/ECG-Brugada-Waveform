@@ -27,6 +27,7 @@ from data.datamodule import UnifiedDataModule
 from models.ecg_transformer import create_ecg_transformer_rope
 from models.losses import get_loss_function
 from models.lightning_module import MultiTaskClassifier
+from helpers.mlflow_utils import setup_mlflow, log_params_from_config  # ← added
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -181,30 +182,29 @@ def main():
         pin_memory=data_config_dict['pin_memory'],
         normalize=data_config_dict['normalize'],
         normalization_method=data_config_dict['normalization_method'],
-        augment_train=data_config_dict['augment_train'],
-        augment_val=data_config_dict['augment_val'],
-        random_seed=data_config_dict['random_seed']
+        augment_train=data_config_dict.get('augment_train', True),
+        augment_val=data_config_dict.get('augment_val', False),
+        random_seed=data_config_dict['random_seed'],
     )
 
     aug_params = data_config_dict.get('augmentation', {})
     augmentation_config = AugmentationConfig(
-        amplitude_scale_range=tuple(aug_params['amplitude_scale_range']),
-        amplitude_scale_prob=aug_params['amplitude_scale_prob'],
-        noise_std=aug_params['noise_std'],
-        noise_prob=aug_params['noise_prob'],
-        baseline_wander_amplitude=aug_params['baseline_wander_amplitude'],
-        baseline_wander_frequency=tuple(aug_params['baseline_wander_frequency']),
-        baseline_wander_prob=aug_params['baseline_wander_prob'],
-        time_warp_sigma=aug_params['time_warp_sigma'],
-        time_warp_knots=aug_params['time_warp_knots'],
-        time_warp_prob=aug_params['time_warp_prob'],
-        lead_scale_range=tuple(aug_params['lead_scale_range']),
-        lead_scale_prob=aug_params['lead_scale_prob'],
-        lead_masking_prob=aug_params.get('lead_masking_prob', 0.3),
-        lead_masking_max_leads=aug_params.get('lead_masking_max_leads', 6)
+        amplitude_scale_range=tuple(aug_params.get('amplitude_scale_range', [0.8, 1.2])),
+        amplitude_scale_prob=aug_params.get('amplitude_scale_prob', 0.3),
+        noise_std=aug_params.get('noise_std', 0.01),
+        noise_prob=aug_params.get('noise_prob', 0.3),
+        baseline_wander_amplitude=aug_params.get('baseline_wander_amplitude', 0.05),
+        baseline_wander_frequency=tuple(aug_params.get('baseline_wander_frequency', [0.05, 0.5])),
+        baseline_wander_prob=aug_params.get('baseline_wander_prob', 0.3),
+        time_warp_sigma=aug_params.get('time_warp_sigma', 0.2),
+        time_warp_knots=aug_params.get('time_warp_knots', 4),
+        time_warp_prob=aug_params.get('time_warp_prob', 0.2),
+        lead_scale_range=tuple(aug_params.get('lead_scale_range', [0.8, 1.2])),
+        lead_scale_prob=aug_params.get('lead_scale_prob', 0.2),
+        lead_masking_prob=aug_params.get('lead_masking_prob', 0.1),
+        lead_masking_max_leads=aug_params.get('lead_masking_max_leads', 6),
     )
 
-    print(f"✓ Using datasets: Brugada={data_config.use_brugada}, PTB-XL={data_config.use_ptbxl}")
     print(f"✓ Target sampling rate: {data_config.target_sampling_rate} Hz")
     print(f"✓ Target length: {data_config.target_length_seconds} seconds")
 
@@ -216,15 +216,12 @@ def main():
     )
     datamodule.setup(stage='fit')
 
-    # Subclass names come from the dataset so the lightning module stays in sync
     subclass_names = datamodule.train_dataset.subclass_order
-
-    # Superclass weights for weighted BCE
     class_weights = datamodule.get_class_weights()
     print(f"\n✓ Class weights computed:")
     for superclass, weight in class_weights['superclass_weights'].items():
         print(f"  {superclass}: {weight:.3f}")
-        
+
     # ── [4/7] Build model ─────────────────────────────────────────────────────
     print("\n[4/7] Building model...")
     model_config = config['model']
@@ -233,7 +230,7 @@ def main():
         model_size=model_config['size'],
         in_channels=model_config['in_channels'],
         num_superclasses=model_config['num_superclasses'],
-        num_subclasses=len(subclass_names),   # derived from data, not hardcoded
+        num_subclasses=len(subclass_names),
         dropout=model_config['dropout']
     )
 
@@ -262,8 +259,6 @@ def main():
             'alpha_superclass':         focal_cfg.get('alpha_superclass', 0.25),
             'alpha_subclass':           focal_cfg.get('alpha_subclass', 0.25),
             'gamma':                    focal_cfg.get('gamma', 2.0),
-            # Per-class alpha overrides for hard subclasses (optional).
-            # Resolved against the runtime subclass_names so indices stay in sync.
             'subclass_alpha_overrides': focal_cfg.get('subclass_alpha_overrides', None),
             'subclass_names':           subclass_names,
         }
@@ -303,7 +298,6 @@ def main():
     cw = combined_auroc_weights or {'superclass': 0.5, 'subclass': 0.5}
     print(f"  Combined AUROC weights: sup={cw.get('superclass', 0.5)}, sub={cw.get('subclass', 0.5)}")
 
-    
     # ── [7/7] Trainer ─────────────────────────────────────────────────────────
     print("\n[7/7] Setting up training...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -339,12 +333,38 @@ def main():
     print(f"  Accelerator:  {config['hardware']['accelerator']}")
     print(f"  Checkpoints:  {checkpoint_dir}")
 
+    # ── MLflow setup ──────────────────────────────────────────────────────────
+    # Resolve experiment name: CLI flag → config → default
+    experiment_name = (
+        args.experiment_name
+        or config.get('logging', {}).get('experiment_name', 'brugada-ecg-classification')
+    )
+    tracking_uri = config.get('logging', {}).get('mlflow_tracking_uri', './mlruns')
+    setup_mlflow(tracking_uri=tracking_uri, experiment_name=experiment_name)
+    print(f"\n✓ MLflow experiment: '{experiment_name}' @ {tracking_uri}")
+
     # ── Train ─────────────────────────────────────────────────────────────────
     print("\n" + "=" * 80)
     print("STARTING TRAINING")
     print("=" * 80)
 
-    trainer.fit(model=lightning_model, datamodule=datamodule)
+    with mlflow.start_run(run_name=run_name):
+        # Log config and dataset info at the start of the run
+        log_params_from_config(config)
+        if datamodule.statistics is not None:
+            s = datamodule.statistics
+            mlflow.log_params({
+                'data/total_samples':   s.total_samples,
+                'data/brugada_samples': s.brugada_samples,
+                'data/ptbxl_samples':   s.ptbxl_samples,
+                'data/normal_samples':  s.normal_samples,
+                'data/mi_samples':      s.mi_samples,
+                'data/sttc_samples':    s.sttc_samples,
+                'data/cd_samples':      s.cd_samples,
+                'data/hyp_samples':     s.hyp_samples,
+            })
+
+        trainer.fit(model=lightning_model, datamodule=datamodule)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 80)
@@ -358,6 +378,7 @@ def main():
     print(f"✓ Best {trainer.checkpoint_callback.monitor}: {best_score:.4f}")
     print(f"\nView results:")
     print(f"  TensorBoard: tensorboard --logdir lightning_logs")
+    print(f"  MLflow:      mlflow ui --backend-store-uri {tracking_uri}")
     print(f"  Checkpoints: {checkpoint_dir}")
 
 
