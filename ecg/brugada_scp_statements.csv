@@ -1,0 +1,3 @@
+,description,diagnostic,form,rhythm,diagnostic_class,diagnostic_subclass,Statement Category,SCP-ECG Statement Description,AHA code,aECG REFID,CDISC Code,DICOM Code
+NORM,Normal ECG,1.0,0.0,0.0,NORM,,diagnostic,Normal ECG,,,,
+BRUG,Brugada Syndrome,1.0,0.0,0.0,CD,BRUG,diagnostic,Brugada syndrome - conduction disorder with characteristic ECG pattern,,,,
